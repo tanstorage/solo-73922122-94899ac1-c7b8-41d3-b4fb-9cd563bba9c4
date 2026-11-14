@@ -2,7 +2,8 @@
 
 数据平台契约发布网页：每条数据链路登记**当前 writer 模式、当前 reader 模式
 及全部已发布 writer 历史**，任何一端升级 Avro 模式前都必须通过兼容性裁决，
-把无法解码的结构挡在数据链路之外。
+把无法解码的结构挡在数据链路之外。内置 **Avro OCF 脱敏下载**：把采集批次
+交给外部分析前，按已提交契约清除客户标识字段。
 
 技术栈：FastAPI + avro（Apache Avro Python 包）+ SQLite。
 
@@ -41,6 +42,32 @@ docker compose up --build
 - **失败保留旧契约**：任何拒绝都发生在事务外或回滚内，库中契约原样不动。
 - **当前模式与历史一起提交**：发布 writer 时，历史 INSERT 与当前模式 UPDATE
   在同一事务内完成。
+
+## OCF 脱敏下载
+
+把采集批次交给外部分析前清除客户标识：
+
+1. 选择链路，页面列出**当前 reader 中类型恰为 `["null","string"]`** 的顶层
+   敏感字段供勾选（`GET /api/links/{name}/mask/fields`）；
+2. 上传 **≤ 2 MiB、codec 为 null** 的 Avro OCF 文件；
+3. 文件头 writer 模式须匹配**某版已发布模式**——按规范化 JSON 比较，
+   **对象键序与空白不影响匹配**；
+4. 服务端用**同一已提交版本**的 reader 与完整 writer 历史解码全文件，
+   仅把选中字段置 null，其余字段的解码值、记录顺序与条数保持一致，
+   再以 **reader 模式**写出新的 OCF（codec=null）；
+5. 成功后页面显示**契约版本、记录数**并自动下载
+   （响应头 `X-Contract-Version` / `X-Record-Count` / `X-Writer-Seq` /
+   `X-Masked-Fields`）。
+
+可靠性保证：
+
+- **不交付部分结果**：模式未登记（`writer_not_registered`）、codec 非 null
+  （`unsupported_codec`）、文件截断/损坏（`invalid_ocf`）、超过 2 MiB
+  （413 `too_large`）或读写失败时，整个请求报错，不落任何部分内容——
+  全部解码与写出都在内存中完成后才返回响应。
+- **一致快照、不占写锁**：脱敏开始时一次性读取契约一致快照（WAL 下的
+  只读事务），处理全程不持 SQLite 写锁；处理期间另一进程发布新契约时，
+  本次仍使用快照中的原版本（可用 `demo_delay_ms` 表单字段放大该窗口演示）。
 
 ## 并发设计（重点）
 
@@ -100,9 +127,16 @@ docker compose up --build
 | PUT | `/api/links/{name}/writer` | 发布新 writer `{schema, demo_delay_ms?}` |
 | PUT | `/api/links/{name}/reader` | 发布新 reader `{schema, demo_delay_ms?}` |
 | POST | `/api/links/{name}/check` | 试算 `{end, schema}`，只检查不提交 |
+| GET | `/api/links/{name}/mask/fields` | 当前 reader 中可脱敏字段（类型恰为 `["null","string"]` 的顶层字段） |
+| POST | `/api/links/{name}/mask` | OCF 脱敏下载：multipart 表单 `file`（≤2 MiB、codec=null）、`fields`（JSON 数组）、`demo_delay_ms?` |
 | DELETE | `/api/links/{name}` | 删除链路（演示重置用） |
 
 - `schema` 接受 JSON 对象或 JSON 字符串；非法 JSON/非法 Avro 模式返回 400。
+- 脱敏成功返回 `application/avro` 附件，元信息在 `X-Contract-Version` /
+  `X-Record-Count` / `X-Writer-Seq` / `X-Masked-Fields` 响应头；
+  失败返回 JSON `detail.error`（`writer_not_registered` / `unsupported_codec` /
+  `invalid_ocf` / `too_large` / `field_not_maskable` / `write_failed`），
+  不交付任何部分结果。
 - 拒绝返回 409，`detail.conflicts[]` 含 `path` / `message` / `writer_seq`，
   `detail.stage` 为 `pre-check`（预检）或 `commit`（提交时裁决），
   `detail.state` 为库中当前（未受影响的）契约。
@@ -119,7 +153,7 @@ docker compose up --build
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt pytest httpx
-pytest tests/ -q                     # 32 个用例：规则 / 历史 / 回滚 / 重启保留 / 并发裁决
+pytest tests/ -q                     # 46 个用例：规则 / 历史 / 回滚 / 重启保留 / 并发裁决 / OCF 脱敏
 
 # 本地起两个共库进程（不用 Docker）
 DB_PATH=/tmp/contracts.db SERVER_ID=web1 uvicorn app.main:app --port 8001 &
@@ -130,10 +164,11 @@ DB_PATH=/tmp/contracts.db SERVER_ID=web2 uvicorn app.main:app --port 8002 &
 
 ```
 app/
-  main.py            FastAPI 路由与错误映射
+  main.py            FastAPI 路由与错误映射（含 OCF 脱敏下载端点）
   compat.py          Avro writer→reader 兼容性检查（冲突路径）
   store.py           SQLite 存储与两阶段发布（预检无锁 / 提交时裁决）
-  static/index.html  网页界面（建链路、发布、查询、并发演示）
+  mask.py            OCF 脱敏：writer 匹配、reader 解码、置 null、reader 写出
+  static/index.html  网页界面（建链路、发布、查询、并发演示、脱敏下载）
 demo/race_demo.sh    跨进程并发演示脚本
 tests/               pytest 用例
 Dockerfile / docker-compose.yml / requirements.txt

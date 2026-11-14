@@ -118,9 +118,22 @@
       </div>
       <div id="result"></div>
     </section>
+    <section>
+      <h2>脱敏下载（Avro OCF）</h2>
+      <p class="dim">把采集批次交给外部分析前清除客户标识：勾选当前 reader 中类型恰为
+        <code>["null","string"]</code> 的顶层敏感字段，上传不超过 2 MiB、codec 为 null 的 OCF 文件。
+        文件头 writer 须匹配某版已发布模式（键序/空白不影响匹配）；用同一已提交版本的 reader
+        解码全文件，仅选中字段置 null，以 reader 模式写出后下载。失败时不交付任何部分结果。</p>
+      <div id="maskFields" class="dim">请先选择链路</div>
+      <div style="margin:8px 0">
+        <input type="file" id="maskFile" accept=".avro,.ocf,application/avro">
+      </div>
+      <button onclick="maskDownload()">脱敏并下载</button>
+      <div id="maskResult"></div>
+    </section>
   </div>
 </main>
-<footer>兼容检查不持 SQLite 写锁；发布在 BEGIN IMMEDIATE 事务内按提交时状态重新裁决，失败回滚保留旧契约；当前 writer 与历史同事务提交，重启保留。</footer>
+<footer>兼容检查不持 SQLite 写锁；发布在 BEGIN IMMEDIATE 事务内按提交时状态重新裁决，失败回滚保留旧契约；当前 writer 与历史同事务提交，重启保留。脱敏下载一次性读取契约一致快照后全内存处理，不持写锁；处理期间他进程发布新版本时本次仍用原版本，失败不交付部分结果。</footer>
 
 <script>
 let current = null;
@@ -190,6 +203,70 @@ async function selectLink(name) {
   el.innerHTML = html;
   document.getElementById("pubWriter").value = pretty(d.writer);
   document.getElementById("pubReader").value = pretty(d.reader);
+  await loadMaskFields();
+}
+
+// ---------------- 脱敏下载 ----------------
+async function loadMaskFields() {
+  const box = document.getElementById("maskFields");
+  document.getElementById("maskResult").innerHTML = "";
+  if (!current) { box.textContent = "请先选择链路"; return; }
+  const r = await api(`/api/links/${encodeURIComponent(current)}/mask/fields`);
+  if (!r.ok) { box.innerHTML = '<span class="bad">可脱敏字段加载失败</span>'; return; }
+  if (!r.data.fields.length) {
+    box.innerHTML = '<span class="dim">当前 reader 没有类型恰为 ["null","string"] 的顶层字段</span>';
+    return;
+  }
+  box.innerHTML = "可脱敏字段（契约 v" + r.data.version + " 的 reader）：" + r.data.fields.map(f =>
+    `<label style="display:inline-block;margin:2px 12px 2px 0;cursor:pointer">
+       <input type="checkbox" class="maskFld" value="${esc(f)}"> ${esc(f)}</label>`).join("");
+}
+
+async function maskDownload() {
+  const el = document.getElementById("maskResult");
+  if (!current) { el.innerHTML = '<span class="bad">请先选择链路</span>'; return; }
+  const fields = [...document.querySelectorAll(".maskFld:checked")].map(c => c.value);
+  if (!fields.length) { el.innerHTML = '<span class="bad">请至少勾选一个脱敏字段</span>'; return; }
+  const fi = document.getElementById("maskFile");
+  if (!fi.files.length) { el.innerHTML = '<span class="bad">请选择要上传的 OCF 文件</span>'; return; }
+  const f = fi.files[0];
+  if (f.size > 2 * 1024 * 1024) { el.innerHTML = '<span class="bad">文件超过 2 MiB 上限</span>'; return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("fields", JSON.stringify(fields));
+  fd.append("demo_delay_ms", document.getElementById("delayMs").value || "0");
+  el.innerHTML = '<span class="dim">处理中…</span>';
+  let resp;
+  try {
+    resp = await fetch(`/api/links/${encodeURIComponent(current)}/mask`, { method: "POST", body: fd });
+  } catch (e) {
+    el.innerHTML = `<div class="bad">✘ 请求失败：${esc(e.message)}（未交付任何结果）</div>`;
+    return;
+  }
+  if (!resp.ok) {
+    let msg = "HTTP " + resp.status;
+    try {
+      const d = await resp.json();
+      if (d.detail && d.detail.message) msg = d.detail.message;
+      else if (typeof d.detail === "string") msg = d.detail;
+      else msg = JSON.stringify(d);
+    } catch (e) { /* ignore */ }
+    el.innerHTML = `<div class="bad">✘ 脱敏失败：${esc(msg)}（未交付任何部分结果）</div>`;
+    return;
+  }
+  const ver = resp.headers.get("X-Contract-Version");
+  const cnt = resp.headers.get("X-Record-Count");
+  const seq = resp.headers.get("X-Writer-Seq");
+  const blob = await resp.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${current}-v${ver}-masked.avro`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  el.innerHTML = `<div class="ok">✔ 脱敏完成：契约版本 v${esc(ver)} · 记录数 ${esc(cnt)} ·
+    文件头 writer 匹配历史 #${esc(seq)} · 字段 ${fields.map(esc).join(", ")} 已置 null，文件已开始下载</div>`;
 }
 
 function renderConflicts(target, title, conflicts, stage) {

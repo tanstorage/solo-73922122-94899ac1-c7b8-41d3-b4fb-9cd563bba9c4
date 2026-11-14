@@ -122,16 +122,27 @@ class Store:
             conn.close()
 
     def get_link(self, name: str) -> Optional[dict]:
+        """读取链路的一致快照：当前契约与完整 writer 历史来自同一个
+        只读事务（WAL 下读者不取写锁、不阻塞写者），即使另一进程正在
+        发布，也不会看到 links 与 writer_history 来自不同版本的混合状态。"""
         conn = self._connect()
         try:
-            row = conn.execute("SELECT * FROM links WHERE name = ?", (name,)).fetchone()
-            if row is None:
-                return None
-            hist = conn.execute(
-                "SELECT seq, schema, published_at FROM writer_history WHERE link = ? ORDER BY seq",
-                (name,),
-            ).fetchall()
-            return self._link_dict(row, hist)
+            conn.execute("BEGIN")  # 只读快照事务（deferred，不取写锁）
+            try:
+                row = conn.execute("SELECT * FROM links WHERE name = ?", (name,)).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    return None
+                hist = conn.execute(
+                    "SELECT seq, schema, published_at FROM writer_history WHERE link = ? ORDER BY seq",
+                    (name,),
+                ).fetchall()
+                conn.execute("COMMIT")
+                return self._link_dict(row, hist)
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
         finally:
             conn.close()
 
